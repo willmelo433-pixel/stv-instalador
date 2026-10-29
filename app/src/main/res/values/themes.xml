@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.STV" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorHint">@color/muted</item>
+    </style>
+</resources>
