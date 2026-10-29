@@ -10,7 +10,7 @@
 
     <application
         android:label="@string/app_name"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/ic_legacy"
         android:banner="@drawable/banner"
         android:theme="@style/Theme.STV"
         android:usesCleartextTraffic="false"
