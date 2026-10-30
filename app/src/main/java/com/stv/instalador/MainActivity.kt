@@ -12,6 +12,8 @@ import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebChromeClient
+import android.webkit.ValueCallback
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import java.io.File
@@ -20,7 +22,6 @@ import java.net.URL
 import java.security.MessageDigest
 import kotlin.concurrent.thread
 
-/** Loads the complete published site; no JavaScript-to-native privileged bridge. */
 class MainActivity : Activity() {
     private lateinit var web: WebView
     private var apk: File? = null
@@ -28,12 +29,14 @@ class MainActivity : Activity() {
     private var waitingPermission = false
     private var waitingInstall = false
     private var downloading = false
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         web = WebView(this)
         web.settings.apply {
+            userAgentString = "$userAgentString STVInstaller/3"
             javaScriptEnabled = true
             domStorageEnabled = true
             allowFileAccess = false
@@ -42,6 +45,14 @@ class MainActivity : Activity() {
             setSupportMultipleWindows(false)
         }
         CookieManager.getInstance().setAcceptCookie(true)
+        web.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(view: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                fileCallback?.onReceiveValue(null)
+                fileCallback = callback
+                return try { startActivityForResult(params.createIntent(), 10); true }
+                catch (_: Exception) { fileCallback = null; callback.onReceiveValue(null); false }
+            }
+        }
         web.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = navigate(request.url)
             @Suppress("DEPRECATION")
@@ -49,8 +60,7 @@ class MainActivity : Activity() {
         }
         web.setDownloadListener { url, _, _, _, _ ->
             val uri = Uri.parse(url)
-            if (uri.scheme == "https" && uri.host?.endsWith(".supabase.co") == true &&
-                uri.path?.startsWith("/storage/v1/object/sign/apk/") == true) {
+            if (uri.scheme == "https" && uri.host?.endsWith(".supabase.co") == true && uri.path?.startsWith("/storage/v1/object/sign/apk/") == true) {
                 web.evaluateJavascript("(document.body.innerText.match(/SHA-256:\\s*([a-fA-F0-9]{64})/)||[])[1]||''") { value ->
                     val checksum = value.trim('"')
                     if (Regex("^[a-fA-F0-9]{64}$").matches(checksum)) download(url, checksum)
@@ -64,8 +74,19 @@ class MainActivity : Activity() {
 
     private fun navigate(uri: Uri): Boolean {
         val site = Uri.parse(BuildConfig.PANEL_URL)
-        if (uri.scheme == "https" && (uri.host == site.host ||
-            (uri.host?.endsWith(".supabase.co") == true && uri.path?.startsWith("/storage/v1/object/sign/apk/") == true))) return false
+        if (uri.scheme == "stv-install" || uri.scheme == "stv-manual") {
+            if (Uri.parse(web.url ?: "").host != site.host) return true
+            val url = uri.getQueryParameter("url") ?: return true
+            val target = Uri.parse(url)
+            if (target.scheme != "https" || target.host?.endsWith(".supabase.co") != true || target.path?.startsWith("/storage/v1/object/sign/apk/") != true) return true
+            if (uri.scheme == "stv-manual") external(target)
+            else {
+                val hash = uri.getQueryParameter("checksum") ?: return true
+                if (Regex("^[a-fA-F0-9]{64}$").matches(hash)) download(url, hash)
+            }
+            return true
+        }
+        if (uri.scheme == "https" && (uri.host == site.host || (uri.host?.endsWith(".supabase.co") == true && uri.path?.startsWith("/storage/v1/object/sign/apk/") == true))) return false
         external(uri)
         return true
     }
@@ -79,7 +100,7 @@ class MainActivity : Activity() {
     private fun download(url: String, checksum: String) {
         if (downloading) return
         downloading = true
-        message("Baixando STV…")
+        message("Baixando aplicativo…")
         thread {
             val file = File(File(filesDir, "apk").apply { mkdirs() }, "stv.apk")
             var connection: HttpURLConnection? = null
@@ -102,8 +123,7 @@ class MainActivity : Activity() {
                 } }
                 val actual = hash.digest().joinToString("") { "%02x".format(it) }
                 check(actual.equals(checksum, true)) { "Arquivo corrompido. Tente novamente." }
-                val pkg = packageManager.getPackageArchiveInfo(file.path, 0)?.packageName
-                    ?: error("Arquivo APK inválido.")
+                val pkg = packageManager.getPackageArchiveInfo(file.path, 0)?.packageName ?: error("Arquivo APK inválido.")
                 runOnUiThread { apk = file; installedPackage = pkg; install() }
             } catch (e: Exception) {
                 file.delete()
@@ -125,8 +145,7 @@ class MainActivity : Activity() {
             }
             val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
             waitingInstall = true
-            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
         } catch (_: Exception) { waitingInstall = false; message("Não foi possível abrir a instalação do Android.") }
     }
 
@@ -135,20 +154,22 @@ class MainActivity : Activity() {
         if (waitingPermission) {
             waitingPermission = false
             if (Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls()) install()
-            else AlertDialog.Builder(this).setMessage("A instalação precisa da sua permissão.")
-                .setPositiveButton("PERMITIR") { _, _ -> install() }.setNegativeButton("CANCELAR", null).show()
+            else AlertDialog.Builder(this).setMessage("A instalação precisa da sua permissão.").setPositiveButton("PERMITIR") { _, _ -> install() }.setNegativeButton("CANCELAR", null).show()
         } else if (waitingInstall) {
             waitingInstall = false
             val pkg = installedPackage ?: return
             val launch = packageManager.getLaunchIntentForPackage(pkg) ?: packageManager.getLeanbackLaunchIntentForPackage(pkg)
-            if (launch != null) AlertDialog.Builder(this).setMessage("STV disponível neste aparelho.")
-                .setPositiveButton("ABRIR STV") { _, _ -> startActivity(launch) }.setNegativeButton("VOLTAR AO SITE", null).show()
-            else AlertDialog.Builder(this).setMessage("Instalação não concluída.")
-                .setPositiveButton("TENTAR NOVAMENTE") { _, _ -> install() }.setNegativeButton("VOLTAR", null).show()
+            if (launch != null) AlertDialog.Builder(this).setMessage("Aplicativo disponível neste aparelho.").setPositiveButton("ABRIR APLICATIVO") { _, _ -> startActivity(launch) }.setNegativeButton("VOLTAR AO SITE", null).show()
+            else AlertDialog.Builder(this).setMessage("Instalação não concluída.").setPositiveButton("TENTAR NOVAMENTE") { _, _ -> install() }.setNegativeButton("VOLTAR", null).show()
         }
     }
 
     private fun message(text: String) { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 10) { fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data)); fileCallback = null }
+    }
     override fun onSaveInstanceState(state: Bundle) { web.saveState(state); super.onSaveInstanceState(state) }
     @Suppress("DEPRECATION")
     override fun onBackPressed() { if (web.canGoBack()) web.goBack() else super.onBackPressed() }
