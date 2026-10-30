@@ -6,8 +6,8 @@ android {
   applicationId = "com.stv.instalador"
   minSdk = 21
   targetSdk = 34
-  versionCode = 3
-  versionName = "3.0.0"
+  versionCode = 4
+  versionName = "3.0.1"
   buildConfigField("String", "PANEL_URL", "\"https://stv-installer-hub.lovable.app\"")
  }
  buildFeatures { buildConfig = true }
