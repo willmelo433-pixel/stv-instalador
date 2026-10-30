@@ -2,227 +2,156 @@ package com.stv.instalador
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.Settings
-import android.view.View
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
-import android.widget.Button
-import android.widget.EditText
-import android.widget.ProgressBar
-import android.widget.TextView
-import androidx.core.content.ContextCompat
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.core.content.FileProvider
 import java.io.File
-import java.util.concurrent.Executors
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import kotlin.concurrent.thread
 
+/** Loads the complete published site; no JavaScript-to-native privileged bridge. */
 class MainActivity : Activity() {
+    private lateinit var web: WebView
+    private var apk: File? = null
+    private var installedPackage: String? = null
+    private var waitingPermission = false
+    private var waitingInstall = false
+    private var downloading = false
 
-    private lateinit var codeInput: EditText
-    private lateinit var validateBtn: Button
-    private lateinit var downloadBtn: Button
-    private lateinit var installBtn: Button
-    private lateinit var otherBtn: Button
-    private lateinit var spinner: ProgressBar
-    private lateinit var progress: ProgressBar
-    private lateinit var progressText: TextView
-    private lateinit var status: TextView
-
-    private val io = Executors.newSingleThreadExecutor()
-    private val main = Handler(Looper.getMainLooper())
-    private var authorized: ActivationResult.Authorized? = null
-    private var downloaded: File? = null
-    private var lastFailedAction: (() -> Unit)? = null
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-        codeInput = findViewById(R.id.codeInput)
-        validateBtn = findViewById(R.id.validateBtn)
-        downloadBtn = findViewById(R.id.downloadBtn)
-        installBtn = findViewById(R.id.installBtn)
-        otherBtn = findViewById(R.id.otherBtn)
-        spinner = findViewById(R.id.spinner)
-        progress = findViewById(R.id.progress)
-        progressText = findViewById(R.id.progressText)
-        status = findViewById(R.id.status)
-
-        validateBtn.setOnClickListener { validate() }
-        downloadBtn.setOnClickListener { startDownload() }
-        installBtn.setOnClickListener { install() }
-        otherBtn.setOnClickListener { reset() }
-        codeInput.setOnEditorActionListener { _, id, _ ->
-            if (id == EditorInfo.IME_ACTION_DONE) { hideKeyboard(); validateBtn.requestFocus(); validate(); true } else false
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(state: Bundle?) {
+        super.onCreate(state)
+        web = WebView(this)
+        web.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            allowFileAccess = false
+            allowContentAccess = false
+            mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            setSupportMultipleWindows(false)
         }
-        codeInput.requestFocus()
+        CookieManager.getInstance().setAcceptCookie(true)
+        web.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = navigate(request.url)
+            @Suppress("DEPRECATION")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean = navigate(Uri.parse(url))
+        }
+        web.setDownloadListener { url, _, _, _, _ ->
+            val uri = Uri.parse(url)
+            if (uri.scheme == "https" && uri.host?.endsWith(".supabase.co") == true &&
+                uri.path?.startsWith("/storage/v1/object/sign/apk/") == true) {
+                web.evaluateJavascript("(document.body.innerText.match(/SHA-256:\\s*([a-fA-F0-9]{64})/)||[])[1]||''") { value ->
+                    val checksum = value.trim('"')
+                    if (Regex("^[a-fA-F0-9]{64}$").matches(checksum)) download(url, checksum)
+                    else message("Não foi possível verificar o arquivo. Valide o código novamente.")
+                }
+            } else external(uri)
+        }
+        setContentView(web)
+        if (state == null || web.restoreState(state) == null) web.loadUrl(BuildConfig.PANEL_URL)
+    }
+
+    private fun navigate(uri: Uri): Boolean {
+        val site = Uri.parse(BuildConfig.PANEL_URL)
+        if (uri.scheme == "https" && (uri.host == site.host ||
+            (uri.host?.endsWith(".supabase.co") == true && uri.path?.startsWith("/storage/v1/object/sign/apk/") == true))) return false
+        external(uri)
+        return true
+    }
+
+    private fun external(uri: Uri) {
+        if (uri.scheme !in listOf("https", "http", "mailto")) return
+        try { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+        catch (_: Exception) { message("Não foi possível abrir este link.") }
+    }
+
+    private fun download(url: String, checksum: String) {
+        if (downloading) return
+        downloading = true
+        message("Baixando STV…")
+        thread {
+            val file = File(File(filesDir, "apk").apply { mkdirs() }, "stv.apk")
+            var connection: HttpURLConnection? = null
+            try {
+                val c = URL(url).openConnection() as HttpURLConnection
+                connection = c
+                c.connectTimeout = 15000
+                c.readTimeout = 30000
+                c.instanceFollowRedirects = false
+                check(c.responseCode == 200) { "Link expirado ou download indisponível." }
+                val hash = MessageDigest.getInstance("SHA-256")
+                c.inputStream.use { input -> file.outputStream().use { output ->
+                    val buffer = ByteArray(65536)
+                    var count = input.read(buffer)
+                    while (count > 0) {
+                        output.write(buffer, 0, count)
+                        hash.update(buffer, 0, count)
+                        count = input.read(buffer)
+                    }
+                } }
+                val actual = hash.digest().joinToString("") { "%02x".format(it) }
+                check(actual.equals(checksum, true)) { "Arquivo corrompido. Tente novamente." }
+                val pkg = packageManager.getPackageArchiveInfo(file.path, 0)?.packageName
+                    ?: error("Arquivo APK inválido.")
+                runOnUiThread { apk = file; installedPackage = pkg; install() }
+            } catch (e: Exception) {
+                file.delete()
+                runOnUiThread { message(e.message ?: "Falha no download. Tente novamente.") }
+            } finally {
+                connection?.disconnect()
+                runOnUiThread { downloading = false }
+            }
+        }
+    }
+
+    private fun install() {
+        val file = apk ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+                waitingPermission = true
+                startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+                return
+            }
+            val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+            waitingInstall = true
+            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+        } catch (_: Exception) { waitingInstall = false; message("Não foi possível abrir a instalação do Android.") }
     }
 
     override fun onResume() {
         super.onResume()
-        if (pendingInstall) { pendingInstall = false; install() }
-    }
-
-    @SuppressLint("HardwareIds")
-    private fun deviceId(): String =
-        Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "desconhecido"
-
-    private fun validate() {
-        val code = codeInput.text.toString().trim().uppercase()
-        if (code.length < 4) { showStatus("Digite um código de ativação válido.", error = true); return }
-        authorized = null
-        downloaded = null
-        setBusy(true)
-        downloadBtn.visibility = View.GONE
-        installBtn.visibility = View.GONE
-        showStatus("Validando código no painel…", error = false)
-        io.execute {
-            try {
-                val result = PanelApi.activate(code, deviceId())
-                main.post {
-                    setBusy(false)
-                    when (result) {
-                        is ActivationResult.Authorized -> {
-                            authorized = result
-                            showStatus("✓ Código válido! Download liberado.", error = false, ok = true)
-                            codeInput.isEnabled = false
-                            validateBtn.visibility = View.GONE
-                            downloadBtn.visibility = View.VISIBLE
-                            otherBtn.visibility = View.VISIBLE
-                            downloadBtn.requestFocus()
-                        }
-                        is ActivationResult.Denied -> {
-                            showStatus(result.message ?: deniedText(result.reason), error = true)
-                            codeInput.requestFocus()
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                main.post { failWithRetry("Falha de conexão: ${e.message ?: "verifique a internet"}", ::validate) }
-            }
+        if (waitingPermission) {
+            waitingPermission = false
+            if (Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls()) install()
+            else AlertDialog.Builder(this).setMessage("A instalação precisa da sua permissão.")
+                .setPositiveButton("PERMITIR") { _, _ -> install() }.setNegativeButton("CANCELAR", null).show()
+        } else if (waitingInstall) {
+            waitingInstall = false
+            val pkg = installedPackage ?: return
+            val launch = packageManager.getLaunchIntentForPackage(pkg) ?: packageManager.getLeanbackLaunchIntentForPackage(pkg)
+            if (launch != null) AlertDialog.Builder(this).setMessage("STV disponível neste aparelho.")
+                .setPositiveButton("ABRIR STV") { _, _ -> startActivity(launch) }.setNegativeButton("VOLTAR AO SITE", null).show()
+            else AlertDialog.Builder(this).setMessage("Instalação não concluída.")
+                .setPositiveButton("TENTAR NOVAMENTE") { _, _ -> install() }.setNegativeButton("VOLTAR", null).show()
         }
     }
 
-    private fun deniedText(reason: String) = when (reason.lowercase()) {
-        "expirado" -> "Código expirado. Solicite um novo código."
-        "bloqueado" -> "Código ou aparelho bloqueado. Entre em contato com o suporte."
-        "usado" -> "Este código já foi usado em outro aparelho."
-        else -> "Código inválido. Confira e tente novamente."
-    }
-
-    private fun startDownload() {
-        val auth = authorized ?: return
-        downloadBtn.isEnabled = false
-        progress.visibility = View.VISIBLE
-        progressText.visibility = View.VISIBLE
-        progress.isIndeterminate = false
-        progress.progress = 0
-        progressText.text = "Iniciando download…"
-        showStatus("Baixando aplicativo STV…", error = false)
-        val target = File(File(filesDir, "apk"), "stv.apk")
-        io.execute {
-            try {
-                val hash = PanelApi.download(auth.downloadUrl, target, auth.size) { pct, bytes ->
-                    main.post {
-                        val mb = "%.1f MB".format(bytes / 1_048_576.0)
-                        if (pct >= 0) { progress.progress = pct; progressText.text = "$pct% · $mb" }
-                        else { progress.isIndeterminate = true; progressText.text = mb }
-                    }
-                }
-                main.post {
-                    if (!hash.equals(auth.sha256, ignoreCase = true)) {
-                        target.delete()
-                        failWithRetry("O arquivo baixado não passou na verificação de integridade (SHA-256). Tente novamente.", ::startDownload)
-                        return@post
-                    }
-                    downloaded = target
-                    progress.isIndeterminate = false
-                    progress.progress = 100
-                    progressText.text = "100% · integridade verificada"
-                    showStatus("✓ Download concluído! Arquivo verificado.", error = false, ok = true)
-                    downloadBtn.visibility = View.GONE
-                    installBtn.visibility = View.VISIBLE
-                    installBtn.requestFocus()
-                }
-            } catch (e: Exception) {
-                target.delete()
-                main.post {
-                    authorized = null
-                    downloadBtn.visibility = View.GONE
-                    progress.visibility = View.GONE
-                    progressText.visibility = View.GONE
-                    codeInput.isEnabled = true
-                    validateBtn.visibility = View.VISIBLE
-                    failWithRetry("Falha no download: ${e.message ?: "conexão interrompida"}. Toque em VALIDAR CÓDIGO para tentar de novo.", ::validate)
-                }
-            }
-        }
-    }
-
-    private var pendingInstall = false
-
-    private fun install() {
-        val file = downloaded ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
-            showStatus("Permita a instalação de apps pelo STV Instalador e volte para continuar.", error = false)
-            pendingInstall = true
-            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
-            return
-        }
-        val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try { startActivity(intent) } catch (e: Exception) {
-            showStatus("Não foi possível abrir o instalador do Android: ${e.message}", error = true)
-        }
-    }
-
-    private fun reset() {
-        authorized = null
-        downloaded?.delete(); downloaded = null
-        codeInput.isEnabled = true
-        codeInput.setText("")
-        validateBtn.visibility = View.VISIBLE
-        validateBtn.isEnabled = true
-        downloadBtn.visibility = View.GONE
-        downloadBtn.isEnabled = true
-        installBtn.visibility = View.GONE
-        otherBtn.visibility = View.GONE
-        progress.visibility = View.GONE
-        progressText.visibility = View.GONE
-        status.visibility = View.GONE
-        codeInput.requestFocus()
-    }
-
-    private fun failWithRetry(msg: String, retry: () -> Unit) {
-        setBusy(false)
-        lastFailedAction = retry
-        showStatus(msg, error = true)
-        downloadBtn.isEnabled = true
-        validateBtn.requestFocus()
-    }
-
-    private fun setBusy(busy: Boolean) {
-        spinner.visibility = if (busy) View.VISIBLE else View.GONE
-        validateBtn.isEnabled = !busy
-        codeInput.isEnabled = !busy && authorized == null
-    }
-
-    private fun showStatus(msg: String, error: Boolean, ok: Boolean = false) {
-        status.visibility = View.VISIBLE
-        status.text = msg
-        status.setTextColor(ContextCompat.getColor(this, when { error -> R.color.error; ok -> R.color.ok; else -> R.color.muted }))
-    }
-
-    private fun hideKeyboard() {
-        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(codeInput.windowToken, 0)
-    }
-
-    override fun onDestroy() { io.shutdownNow(); super.onDestroy() }
+    private fun message(text: String) { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
+    override fun onSaveInstanceState(state: Bundle) { web.saveState(state); super.onSaveInstanceState(state) }
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() { if (web.canGoBack()) web.goBack() else super.onBackPressed() }
+    override fun onPause() { CookieManager.getInstance().flush(); super.onPause() }
+    override fun onDestroy() { web.destroy(); super.onDestroy() }
 }
