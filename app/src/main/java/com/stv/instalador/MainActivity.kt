@@ -22,6 +22,7 @@ import java.net.URL
 import java.security.MessageDigest
 import kotlin.concurrent.thread
 
+/** Loads the complete published site; no JavaScript-to-native privileged bridge. */
 class MainActivity : Activity() {
     private lateinit var web: WebView
     private var apk: File? = null
@@ -29,6 +30,7 @@ class MainActivity : Activity() {
     private var waitingPermission = false
     private var waitingInstall = false
     private var downloading = false
+    private val queue = ArrayDeque<Pair<String, String>>()
     private var fileCallback: ValueCallback<Array<Uri>>? = null
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -36,7 +38,7 @@ class MainActivity : Activity() {
         super.onCreate(state)
         web = WebView(this)
         web.settings.apply {
-            userAgentString = "$userAgentString STVInstaller/3"
+            userAgentString = "$userAgentString STVInstaller/4"
             javaScriptEnabled = true
             domStorageEnabled = true
             allowFileAccess = false
@@ -60,7 +62,9 @@ class MainActivity : Activity() {
         }
         web.setDownloadListener { url, _, _, _, _ ->
             val uri = Uri.parse(url)
-            if (uri.scheme == "https" && uri.host?.endsWith(".supabase.co") == true && uri.path?.startsWith("/storage/v1/object/sign/apk/") == true) {
+            if (uri.scheme == "https" && uri.host?.endsWith(".supabase.co") == true &&
+                uri.path?.startsWith("/storage/v1/object/sign/apk/") == true) {
+                // Read only the visible checksum from the trusted site's activation result.
                 web.evaluateJavascript("(document.body.innerText.match(/SHA-256:\\s*([a-fA-F0-9]{64})/)||[])[1]||''") { value ->
                     val checksum = value.trim('"')
                     if (Regex("^[a-fA-F0-9]{64}$").matches(checksum)) download(url, checksum)
@@ -74,11 +78,25 @@ class MainActivity : Activity() {
 
     private fun navigate(uri: Uri): Boolean {
         val site = Uri.parse(BuildConfig.PANEL_URL)
+        if (uri.scheme == "stv-install-all") {
+            if (Uri.parse(web.url ?: "").host != site.host) return true
+            queue.clear()
+            var i = 0
+            while (true) {
+                val u = uri.getQueryParameter("u$i") ?: break
+                val c = uri.getQueryParameter("c$i") ?: break
+                if (validApk(u) && Regex("^[a-fA-F0-9]{64}$").matches(c)) queue.addLast(u to c)
+                i++
+            }
+            nextInQueue()
+            return true
+        }
         if (uri.scheme == "stv-install" || uri.scheme == "stv-manual") {
             if (Uri.parse(web.url ?: "").host != site.host) return true
             val url = uri.getQueryParameter("url") ?: return true
             val target = Uri.parse(url)
-            if (target.scheme != "https" || target.host?.endsWith(".supabase.co") != true || target.path?.startsWith("/storage/v1/object/sign/apk/") != true) return true
+            if (target.scheme != "https" || target.host?.endsWith(".supabase.co") != true ||
+                target.path?.startsWith("/storage/v1/object/sign/apk/") != true) return true
             if (uri.scheme == "stv-manual") external(target)
             else {
                 val hash = uri.getQueryParameter("checksum") ?: return true
@@ -86,8 +104,21 @@ class MainActivity : Activity() {
             }
             return true
         }
-        if (uri.scheme == "https" && (uri.host == site.host || (uri.host?.endsWith(".supabase.co") == true && uri.path?.startsWith("/storage/v1/object/sign/apk/") == true))) return false
+        if (uri.scheme == "https" && (uri.host == site.host ||
+            (uri.host?.endsWith(".supabase.co") == true && uri.path?.startsWith("/storage/v1/object/sign/apk/") == true))) return false
         external(uri)
+        return true
+    }
+
+    private fun validApk(url: String): Boolean {
+        val t = Uri.parse(url)
+        return t.scheme == "https" && t.host?.endsWith(".supabase.co") == true &&
+            t.path?.startsWith("/storage/v1/object/sign/apk/") == true
+    }
+
+    private fun nextInQueue(): Boolean {
+        val next = queue.removeFirstOrNull() ?: return false
+        download(next.first, next.second)
         return true
     }
 
@@ -123,11 +154,12 @@ class MainActivity : Activity() {
                 } }
                 val actual = hash.digest().joinToString("") { "%02x".format(it) }
                 check(actual.equals(checksum, true)) { "Arquivo corrompido. Tente novamente." }
-                val pkg = packageManager.getPackageArchiveInfo(file.path, 0)?.packageName ?: error("Arquivo APK inválido.")
+                val pkg = packageManager.getPackageArchiveInfo(file.path, 0)?.packageName
+                    ?: error("Arquivo APK inválido.")
                 runOnUiThread { apk = file; installedPackage = pkg; install() }
             } catch (e: Exception) {
                 file.delete()
-                runOnUiThread { message(e.message ?: "Falha no download. Tente novamente.") }
+                runOnUiThread { queue.clear(); message(e.message ?: "Falha no download. Tente novamente.") }
             } finally {
                 connection?.disconnect()
                 runOnUiThread { downloading = false }
@@ -145,7 +177,8 @@ class MainActivity : Activity() {
             }
             val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
             waitingInstall = true
-            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
         } catch (_: Exception) { waitingInstall = false; message("Não foi possível abrir a instalação do Android.") }
     }
 
@@ -154,13 +187,21 @@ class MainActivity : Activity() {
         if (waitingPermission) {
             waitingPermission = false
             if (Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls()) install()
-            else AlertDialog.Builder(this).setMessage("A instalação precisa da sua permissão.").setPositiveButton("PERMITIR") { _, _ -> install() }.setNegativeButton("CANCELAR", null).show()
+            else AlertDialog.Builder(this).setMessage("A instalação precisa da sua permissão.")
+                .setPositiveButton("PERMITIR") { _, _ -> install() }.setNegativeButton("CANCELAR", null).show()
         } else if (waitingInstall) {
             waitingInstall = false
             val pkg = installedPackage ?: return
+            if (queue.isNotEmpty()) {
+                message("Instalando o próximo aplicativo…")
+                nextInQueue()
+                return
+            }
             val launch = packageManager.getLaunchIntentForPackage(pkg) ?: packageManager.getLeanbackLaunchIntentForPackage(pkg)
-            if (launch != null) AlertDialog.Builder(this).setMessage("Aplicativo disponível neste aparelho.").setPositiveButton("ABRIR APLICATIVO") { _, _ -> startActivity(launch) }.setNegativeButton("VOLTAR AO SITE", null).show()
-            else AlertDialog.Builder(this).setMessage("Instalação não concluída.").setPositiveButton("TENTAR NOVAMENTE") { _, _ -> install() }.setNegativeButton("VOLTAR", null).show()
+            if (launch != null) AlertDialog.Builder(this).setMessage("Aplicativo disponível neste aparelho.")
+                .setPositiveButton("ABRIR APLICATIVO") { _, _ -> startActivity(launch) }.setNegativeButton("VOLTAR AO SITE", null).show()
+            else AlertDialog.Builder(this).setMessage("Instalação não concluída.")
+                .setPositiveButton("TENTAR NOVAMENTE") { _, _ -> install() }.setNegativeButton("VOLTAR", null).show()
         }
     }
 
@@ -168,7 +209,10 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 10) { fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data)); fileCallback = null }
+        if (requestCode == 10) {
+            fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+            fileCallback = null
+        }
     }
     override fun onSaveInstanceState(state: Bundle) { web.saveState(state); super.onSaveInstanceState(state) }
     @Suppress("DEPRECATION")
